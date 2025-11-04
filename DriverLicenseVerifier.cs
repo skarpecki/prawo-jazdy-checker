@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.ServiceModel;
 using System.ServiceModel.Security;
@@ -12,6 +15,12 @@ namespace UpkiClient;
 
 internal sealed class DriverLicenseVerifier : IAsyncDisposable
 {
+    private const double InitialBackoffDelayMinutes = 0.5;
+    private const double MaxBackoffDelayMinutes = 60;
+
+    private readonly object _backoffLock = new();
+    private double _backoffDelayMinutes = InitialBackoffDelayMinutes;
+
     private readonly UprawnieniaKierowcowPrzewoznicyApiClient _client;
 
     public DriverLicenseVerifier(string endpointUrl, string certificatePath, string certificatePassword)
@@ -55,8 +64,41 @@ internal sealed class DriverLicenseVerifier : IAsyncDisposable
         DaneDokumentuRequest request,
         CancellationToken cancellationToken)
     {
-        var response = await _client.pytanieOUprawnieniaAsync(request).ConfigureAwait(false);
-        return ParseResponse(request, response?.DaneDokumentuResponse);
+        var backoffAttempts = 0;
+        var nextDelayMinutes = ReadBackoffDelayMinutes();
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            
+            try
+            {
+                var response = await _client.pytanieOUprawnieniaAsync(request).ConfigureAwait(false);
+                return ParseResponse(request, response?.DaneDokumentuResponse);
+            }
+            catch (Exception ex) when (IsTooManyRequests(ex))
+            {
+                backoffAttempts++;
+
+                if (nextDelayMinutes > MaxBackoffDelayMinutes)
+                {
+                    throw new TooManyRequestsBackoffException(
+                        backoffAttempts,
+                        TimeSpan.FromMinutes(nextDelayMinutes),
+                        ex);
+                }
+
+                // Save current delay to start with it in future call
+                StoreBackoffDelayMinutes(nextDelayMinutes);
+                var delay = TimeSpan.FromMinutes(nextDelayMinutes);
+
+                Console.WriteLine($"  Serwer zwrócił 429 (Too Many Requests). Ponowna próba za {delay.TotalMinutes} min.");
+
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+
+                nextDelayMinutes = checked(nextDelayMinutes * 2);
+            }
+        }
     }
 
     private static IReadOnlyList<DriverCategoryInfo> ParseResponse(
@@ -138,6 +180,105 @@ internal sealed class DriverLicenseVerifier : IAsyncDisposable
 
         return ValueTask.CompletedTask;
     }
+
+    private double ReadBackoffDelayMinutes()
+    {
+        lock (_backoffLock)
+        {
+            return _backoffDelayMinutes;
+        }
+    }
+
+    private void StoreBackoffDelayMinutes(double delayMinutes)
+    {
+        lock (_backoffLock)
+        {
+            _backoffDelayMinutes = delayMinutes;
+        }
+    }
+
+    private static bool IsTooManyRequests(Exception exception)
+    {
+        foreach (var candidate in EnumerateExceptionChain(exception))
+        {
+            switch (candidate)
+            {
+                case HttpRequestException httpRequestException
+                    when httpRequestException.StatusCode == HttpStatusCode.TooManyRequests:
+                    return true;
+
+                case WebException webException
+                    when IsTooManyRequests(webException):
+                    return true;
+
+                case ProtocolException protocolException
+                    when ProtocolExceptionIndicatesTooManyRequests(protocolException):
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsTooManyRequests(WebException webException)
+    {
+        if (webException.Response is HttpWebResponse httpResponse)
+        {
+            return httpResponse.StatusCode == HttpStatusCode.TooManyRequests;
+        }
+
+        return webException.Status == WebExceptionStatus.ProtocolError &&
+               webException.Message.Contains("429", StringComparison.Ordinal);
+    }
+
+    private static bool ProtocolExceptionIndicatesTooManyRequests(ProtocolException protocolException)
+    {
+        if (protocolException.InnerException is WebException webException &&
+            IsTooManyRequests(webException))
+        {
+            return true;
+        }
+
+        var message = protocolException.Message;
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            if (message.IndexOf("429", StringComparison.Ordinal) >= 0 ||
+                message.Contains("Too Many Requests", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<Exception> EnumerateExceptionChain(Exception exception)
+    {
+        var stack = new Stack<Exception>();
+        stack.Push(exception);
+
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            yield return current;
+
+            if (current is AggregateException aggregate && aggregate.InnerExceptions is { Count: > 0 })
+            {
+                foreach (var inner in aggregate.InnerExceptions)
+                {
+                    if (inner != null)
+                    {
+                        stack.Push(inner);
+                    }
+                }
+            }
+
+            if (current.InnerException != null)
+            {
+                stack.Push(current.InnerException);
+            }
+        }
+    }
 }
 
 internal sealed record DriverCategoryInfo(
@@ -148,3 +289,19 @@ internal sealed record DriverCategoryInfo(
     string Kategoria,
     DateTime? DataWaznosci,
     string? PowodZmiany);
+
+internal sealed class TooManyRequestsBackoffException : Exception
+{
+    public TooManyRequestsBackoffException(int attempts, TimeSpan nextDelay, Exception innerException)
+        : base(
+            $"Server returned HTTP 429 {attempts} times. Next retry delay of {nextDelay} exceeds backoff limit.",
+            innerException)
+    {
+        Attempts = attempts;
+        NextDelay = nextDelay;
+    }
+
+    public int Attempts { get; }
+
+    public TimeSpan NextDelay { get; }
+}

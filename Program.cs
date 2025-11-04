@@ -141,6 +141,19 @@ static async Task<int> RunAsync()
                 exitCode = faultExitCode;
             }
         }
+        catch (TooManyRequestsBackoffException rateLimitEx)
+        {
+            FailureLogger.LogRequestFailure(
+                request,
+                "HTTP 429 (limit)",
+                $"Otrzymano HTTP 429 Too Many Requests {rateLimitEx.Attempts} razy. Kolejna przerwa wyniosłaby {rateLimitEx.NextDelay}.",
+                jsonOptions);
+
+            Console.Error.WriteLine("  Serwer wielokrotnie zwrócił 429. Przerywam działanie programu.");
+            Console.Error.WriteLine($"  Szczegóły: {rateLimitEx.Message}");
+
+            return -5;
+        }
         catch (Exception ex)
         {
             FailureLogger.LogRequestFailure(request, ex.GetType().Name, ex.ToString(), jsonOptions);
