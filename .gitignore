@@ -1,0 +1,8 @@
+.vs
+bin
+obj
+*.docx
+*.pem
+*.jks
+appsettings.json
+ServiceReference/dotnet-svcutil.params.json
