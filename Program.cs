@@ -1,9 +1,7 @@
 using CsvHelper;
+using CsvHelper.Configuration;
 using Microsoft.Extensions.Configuration;
-using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
-using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.ServiceModel;
 using System.ServiceModel.Security;
@@ -11,124 +9,287 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using UpkiClient;
-using UpkiClient.Generated; // from dotnet-svcutil output
+using UpkiClient.Generated; 
 
-// 1) Load config
-var config = new ConfigurationBuilder()
-    .AddJsonFile("appsettings.json", optional: false)
-    .Build();
 
-var app = config.GetSection("App").Get<AppSettings>() ?? new AppSettings();
+return await RunAsync();
 
-var jsonOptions = new JsonSerializerOptions
+static async Task<int> RunAsync()
 {
-    WriteIndented = true,
-    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-};
+    Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
-var binding = new BasicHttpsBinding()
-{
-    Security = new BasicHttpsSecurity()
-    {
-        Mode = BasicHttpsSecurityMode.Transport,
-        Transport = { ClientCredentialType = HttpClientCredentialType.Certificate }
-    }
-};
-var address = new EndpointAddress(app.EndpointUrl);
-var client = new UprawnieniaKierowcowPrzewoznicyApiClient(binding, address);
+    var config = new ConfigurationBuilder()
+        .AddJsonFile("appsettings.json", optional: false)
+        .Build();
 
-client.ClientCredentials.ServiceCertificate.SslCertificateAuthentication =
-    new X509ServiceCertificateAuthentication
+    var app = config.GetSection("App").Get<AppSettings>() ?? new AppSettings();
+
+    var jsonOptions = new JsonSerializerOptions
     {
-        CertificateValidationMode = X509CertificateValidationMode.None
+        WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-var cert = new X509Certificate2(app.ClientCertPath);
+    var minDelay = Math.Clamp(app.DelayLowerBound_ms, 5000, 10000);
+    var maxDelay = Math.Clamp(app.DelayUpperBound_ms, 5000, 10000);
+    if (minDelay > maxDelay)
+    {
+        (minDelay, maxDelay) = (maxDelay, minDelay);
+    }
+    var maxDelayExclusive = maxDelay + 1;
 
-client.ClientCredentials.ClientCertificate.Certificate = cert;
+    var binding = new BasicHttpsBinding()
+    {
+        Security = new BasicHttpsSecurity()
+        {
+            Mode = BasicHttpsSecurityMode.Transport,
+            Transport = { ClientCredentialType = HttpClientCredentialType.Certificate }
+        }
+    };
 
-var request = new DaneDokumentuRequest
-{
-    imiePierwsze = "YUNIOR",
-    nazwisko = "KACPRUK",
-    seriaNumerBlankietuDruku = "FT100028"
-};
-
-try
-{
-    var response = client.pytanieOUprawnieniaAsync(request).GetAwaiter().GetResult();
-
-    var flattened = ParseResponse(request, response?.DaneDokumentuResponse);
-    var csvOutputPath = Path.Combine(Environment.CurrentDirectory, "output.csv");
+    var address = new EndpointAddress(app.EndpointUrl);
+    UprawnieniaKierowcowPrzewoznicyApiClient? client = null;
 
     try
     {
-        WriteCsv(csvOutputPath, flattened);
-    }
-    catch (Exception csvEx)
-    {
-        LogFailure(request, $"CSV write failed: {csvEx.GetType().Name}", csvEx.ToString(), jsonOptions);
-        Console.Error.WriteLine($"Błąd zapisu do pliku CSV '{csvOutputPath}': {csvEx.Message}");
-        return -2;
-    }
+        client = new UprawnieniaKierowcowPrzewoznicyApiClient(binding, address);
 
-    foreach (var record in flattened)
-    {
-        Console.WriteLine(JsonSerializer.Serialize(record, jsonOptions));
-    }
+        client.ClientCredentials.ServiceCertificate.SslCertificateAuthentication =
+            new X509ServiceCertificateAuthentication
+            {
+                CertificateValidationMode = X509CertificateValidationMode.None
+            };
 
-    if (flattened.Count == 0)
-    {
-        Console.WriteLine("Brak danych kategorii w odpowiedzi. Zapisano pusty plik output.csv.");
-    }
-    else
-    {
-        Console.WriteLine($"Zapisano {flattened.Count} rekordów do {csvOutputPath}.");
-    }
+        var cert = string.IsNullOrWhiteSpace(app.ClientCertPassword)
+            ? new X509Certificate2(app.ClientCertPath)
+            : new X509Certificate2(app.ClientCertPath, app.ClientCertPassword);
 
-    return 0;
-}
-catch (FaultException<CepikException> cepikFault)
-{
-    LogFailure(request, $"SOAP Fault: {cepikFault.Code.Name}", BuildFaultDetails(cepikFault), jsonOptions);
+        client.ClientCredentials.ClientCertificate.Certificate = cert;
 
-    Console.Error.WriteLine($"Fault Code: {cepikFault.Code.Name}");
-    Console.Error.WriteLine($"Fault Reason: {cepikFault.Reason.GetMatchingTranslation().Text}");
+        var inputPath = ResolveInputCsvPath(app);
+        var requests = LoadRequestsFromCsv(inputPath);
+        var random = new Random();
+        var csvOutputPath = Path.Combine(Environment.CurrentDirectory, "output.csv");
+        var exitCode = 0;
 
-    if (cepikFault.Detail?.komunikaty != null)
-    {
-        Console.Error.WriteLine("\nSzczegóły błędu:");
-        foreach (var kom in cepikFault.Detail.komunikaty)
+        if (requests.Count == 0)
         {
-            Console.Error.WriteLine($"  Typ: {kom.typ}");
-            Console.Error.WriteLine($"  Kod: {kom.kod}");
-            Console.Error.WriteLine($"  Komunikat: {kom.komunikat}");
+            Console.WriteLine($"Brak rekordów w pliku wejściowym {inputPath}. Zapisano pusty plik {csvOutputPath}.");
+            try
+            {
+                using var csvStream = new StreamWriter(csvOutputPath, false, new UTF8Encoding(false));
+                using var csv = new CsvWriter(csvStream, CultureInfo.InvariantCulture);
+                csv.WriteHeader<DriverCategoryInfo>();
+                csv.NextRecord();
+            }
+            catch (Exception csvEx)
+            {
+                Console.Error.WriteLine($"Błąd zapisu do pliku CSV '{csvOutputPath}': {csvEx.Message}");
+                return -2;
+            }
 
-            if (!string.IsNullOrEmpty(kom.szczegoly))
-                Console.Error.WriteLine($"  Szczegóły: {kom.szczegoly}");
+            return exitCode;
+        }
 
-            if (!string.IsNullOrEmpty(kom.identyfikatorBledu))
-                Console.Error.WriteLine($"  ID błędu: {kom.identyfikatorBledu}");
+        using var outputStream = new StreamWriter(csvOutputPath, false, new UTF8Encoding(false));
+        using var outputCsv = new CsvWriter(outputStream, CultureInfo.InvariantCulture);
+        outputCsv.WriteHeader<DriverCategoryInfo>();
+        outputCsv.NextRecord();
+        outputStream.Flush();
 
-            Console.Error.WriteLine();
+        Console.WriteLine($"Rozpoczynam przetwarzanie {requests.Count} zapytań z pliku {inputPath}.");
+
+        var totalWritten = 0;
+
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+
+            try
+            {
+                var response = await client.pytanieOUprawnieniaAsync(request).ConfigureAwait(false);
+                var flattened = ParseResponse(request, response?.DaneDokumentuResponse);
+
+                if (flattened.Count == 0)
+                {
+                    Console.WriteLine($"Brak danych kategorii w odpowiedzi dla {request.imiePierwsze} {request.nazwisko} ({request.seriaNumerBlankietuDruku}).");
+                }
+                else
+                {
+                    foreach (var record in flattened)
+                    {
+                        Console.WriteLine(JsonSerializer.Serialize(record, jsonOptions));
+                        try
+                        {
+                            outputCsv.WriteRecord(record);
+                            outputCsv.NextRecord();
+                            outputStream.Flush();
+                            totalWritten++;
+                        }
+                        catch (Exception csvEx)
+                        {
+                            LogFailure(request, $"CSV write failed: {csvEx.GetType().Name}", csvEx.ToString(), jsonOptions);
+                            Console.Error.WriteLine($"Błąd zapisu do pliku CSV '{csvOutputPath}': {csvEx.Message}");
+                            return -2;
+                        }
+                    }
+                }
+            }
+            catch (FaultException<CepikException> cepikFault)
+            {
+                LogFailure(request, $"SOAP Fault: {cepikFault.Code.Name}", BuildFaultDetails(cepikFault), jsonOptions);
+
+                Console.Error.WriteLine($"Fault Code: {cepikFault.Code.Name}");
+                Console.Error.WriteLine($"Fault Reason: {cepikFault.Reason.GetMatchingTranslation().Text}");
+
+                if (cepikFault.Detail?.komunikaty != null)
+                {
+                    Console.Error.WriteLine("\nSzczegóły błędu:");
+                    foreach (var kom in cepikFault.Detail.komunikaty)
+                    {
+                        Console.Error.WriteLine($"  Typ: {kom.typ}");
+                        Console.Error.WriteLine($"  Kod: {kom.kod}");
+                        Console.Error.WriteLine($"  Komunikat: {kom.komunikat}");
+
+                        if (!string.IsNullOrEmpty(kom.szczegoly))
+                            Console.Error.WriteLine($"  Szczegóły: {kom.szczegoly}");
+
+                        if (!string.IsNullOrEmpty(kom.identyfikatorBledu))
+                            Console.Error.WriteLine($"  ID błędu: {kom.identyfikatorBledu}");
+
+                        Console.Error.WriteLine();
+                    }
+                }
+
+                if (exitCode == 0)
+                {
+                    exitCode = -1;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFailure(request, ex.GetType().Name, ex.ToString(), jsonOptions);
+
+                Console.Error.WriteLine("Call failed:");
+                Console.Error.WriteLine(ex);
+
+                exitCode = -3;
+            }
+
+            if (i < requests.Count - 1)
+            {
+                var delayMs = random.Next(minDelay, maxDelayExclusive);
+                await Task.Delay(delayMs).ConfigureAwait(false);
+            }
+        }
+
+        Console.WriteLine($"Zapisano {totalWritten} rekordów do {csvOutputPath}.");
+
+        return exitCode;
+    }
+    finally
+    {
+        if (client != null)
+        {
+            try { if (client.State != CommunicationState.Closed) client.Close(); }
+            catch { client.Abort(); }
+        }
+    }
+}
+
+static string ResolveInputCsvPath(AppSettings settings)
+{
+    var path = settings.InputCsvPath;
+
+    if (string.IsNullOrWhiteSpace(path))
+    {
+        path = Path.Combine(Environment.CurrentDirectory, "dokumentacja", "input.csv");
+    }
+    else if (!Path.IsPathRooted(path))
+    {
+        path = Path.GetFullPath(path);
+    }
+
+    return path;
+}
+
+static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath)
+{
+    var requests = new List<DaneDokumentuRequest>();
+
+    if (string.IsNullOrWhiteSpace(inputPath))
+    {
+        return requests;
+    }
+
+    if (!File.Exists(inputPath))
+    {
+        Console.Error.WriteLine($"Nie znaleziono pliku wejściowego: {inputPath}");
+        return requests;
+    }
+
+    var csvConfig = new CsvConfiguration(CultureInfo.InvariantCulture)
+    {
+        Delimiter = "\t",
+        TrimOptions = TrimOptions.Trim,
+        MissingFieldFound = null,
+        HeaderValidated = null,
+        BadDataFound = ctx => Console.Error.WriteLine($"Nieprawidłowy rekord w wierszu {ctx.Context.Parser.Row}: {ctx.RawRecord}"),
+        PrepareHeaderForMatch = args => args.Header?.Trim()
+    };
+
+    using var reader = new StreamReader(inputPath, GetInputCsvEncoding(), detectEncodingFromByteOrderMarks: true);
+    using var csv = new CsvReader(reader, csvConfig);
+    csv.Context.RegisterClassMap<DriverInputRowMap>();
+
+    while (csv.Read())
+    {
+        try
+        {
+            var row = csv.GetRecord<DriverInputRow>();
+            if (row == null)
+            {
+                continue;
+            }
+
+            var firstName = row.FirstName?.Trim();
+            var lastName = row.LastName?.Trim();
+            var documentNumber = row.DocumentNumber?.Trim();
+
+            if (string.IsNullOrWhiteSpace(firstName) ||
+                string.IsNullOrWhiteSpace(lastName) ||
+                string.IsNullOrWhiteSpace(documentNumber))
+            {
+                Console.Error.WriteLine($"Pomijam niekompletny wiersz (linia {csv.Context.Parser.Row}).");
+                continue;
+            }
+
+            requests.Add(new DaneDokumentuRequest
+            {
+                imiePierwsze = firstName,
+                nazwisko = lastName,
+                seriaNumerBlankietuDruku = documentNumber
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Błąd parsowania wiersza CSV (linia {csv.Context.Parser.Row}): {ex.Message}");
         }
     }
 
-    return -1;
+    return requests;
 }
-catch (Exception ex)
-{
-    LogFailure(request, ex.GetType().Name, ex.ToString(), jsonOptions);
 
-    Console.Error.WriteLine("Call failed:");
-    Console.Error.WriteLine(ex);
-
-    return -3;
-}
-finally
+static Encoding GetInputCsvEncoding()
 {
-    try { if (client.State != CommunicationState.Closed) client.Close(); }
-    catch { client.Abort(); }
+    try
+    {
+        return Encoding.GetEncoding("ISO-8859-2");
+    }
+    catch (Exception)
+    {
+        return Encoding.Latin1;
+    }
 }
 
 static List<DriverCategoryInfo> ParseResponse(DaneDokumentuRequest request, DaneDokumentuResponse? response)
@@ -162,7 +323,7 @@ static List<DriverCategoryInfo> ParseResponse(DaneDokumentuRequest request, Dane
             licenseNumber ?? string.Empty,
             statusText ?? string.Empty,
             category.kategoria ?? string.Empty,
-            category.dataWaznosciSpecified ? category.dataWaznosci : null,
+            category.dataWaznosciSpecified ? category.dataWaznosci : new DateTime(2099, 12, 31),
             reasonText));
     }
 
@@ -181,7 +342,7 @@ static string? BuildKeyValueMessagesFromList(IEnumerable<KodWartoscSlownikowa> k
     return keyValueFragments.Length == 0 ? null : string.Join("; ", keyValueFragments);
 }
 
-static string? BuildKeyValueMessage(KodWartoscSlownikowa keyValue)
+static string? BuildKeyValueMessage(KodWartoscSlownikowa? keyValue)
 {
     if (keyValue is null)
     {
@@ -257,19 +418,21 @@ static void LogFailure(DaneDokumentuRequest request, string errorLabel, string? 
     Console.Error.WriteLine(JsonSerializer.Serialize(payload, options));
 }
 
-static void WriteCsv(string filePath, IReadOnlyCollection<DriverCategoryInfo> rows)
+sealed class DriverInputRow
 {
-    using var writer = new StreamWriter(filePath, false, new UTF8Encoding(false));
-    using var csv = new CsvWriter(writer, CultureInfo.InvariantCulture);
+    public string? FirstName { get; set; }
+    public string? LastName { get; set; }
+    public string? DocumentNumber { get; set; }
+}
 
-    if (rows.Count == 0)
+sealed class DriverInputRowMap : ClassMap<DriverInputRow>
+{
+    public DriverInputRowMap()
     {
-        csv.WriteHeader<DriverCategoryInfo>();
-        csv.NextRecord();
-        return;
+        Map(m => m.FirstName).Name("Imię", "Imie", "Imi?", "IMIE");
+        Map(m => m.LastName).Name("Nazwisko", "NAZWISKO");
+        Map(m => m.DocumentNumber).Name("NumerDokumentu", "Numer Dokumentu", "NumerBlankietu", "Numer", "NUMERDOKUMENTU");
     }
-
-    csv.WriteRecords(rows);
 }
 
 internal sealed record DriverCategoryInfo(
