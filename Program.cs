@@ -83,7 +83,7 @@ static async Task<int> RunAsync()
     {
         Console.WriteLine("Plik CSV nie zawiera poprawnych wierszy do przetworzenia. Utworzono pusty plik wynikowy.");
         EnsureOutputDirectory(outputPath);
-        using var emptyWriter = new StreamWriter(outputPath, false, new UTF8Encoding(false));
+        using var emptyWriter = new StreamWriter(outputPath, false, inputEncoding);
         using var emptyCsv = new CsvWriter(emptyWriter, CultureInfo.InvariantCulture);
         emptyCsv.WriteHeader<DriverCategoryInfo>();
         emptyCsv.NextRecord();
@@ -96,7 +96,7 @@ static async Task<int> RunAsync()
 
     EnsureOutputDirectory(outputPath);
     await using var verifier = new DriverLicenseVerifier(endpointUrl, certPath, certPassword);
-    await using var outputStream = new StreamWriter(outputPath, false, new UTF8Encoding(false));
+    await using var outputStream = new StreamWriter(outputPath, false, inputEncoding);
     await using var outputCsv = new CsvWriter(outputStream, CultureInfo.InvariantCulture);
     outputCsv.WriteHeader<DriverCategoryInfo>();
     outputCsv.NextRecord();
