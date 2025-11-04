@@ -6,3 +6,4 @@ obj
 *.jks
 appsettings.json
 ServiceReference/dotnet-svcutil.params.json
+dokumentacja
