@@ -1,28 +1,69 @@
 using CsvHelper;
 using CsvHelper.Configuration;
 using Microsoft.Extensions.Configuration;
+using System;
+using System.Collections.Generic;
 using System.Globalization;
-using System.Security.Cryptography.X509Certificates;
-using System.ServiceModel;
-using System.ServiceModel.Security;
+using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 using UpkiClient;
-using UpkiClient.Generated; 
+using UpkiClient.Generated;
+using System.ServiceModel;
 
+Console.OutputEncoding = Encoding.UTF8;
+Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
 return await RunAsync();
 
 static async Task<int> RunAsync()
 {
-    Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-
     var config = new ConfigurationBuilder()
         .AddJsonFile("appsettings.json", optional: false)
         .Build();
 
-    var app = config.GetSection("App").Get<AppSettings>() ?? new AppSettings();
+    var appSettings = config.GetSection("App").Get<AppSettings>() ?? new AppSettings();
+    var workingDirectory = ResolveWorkingDirectory(appSettings.WorkingDirectory);
+    var endpointUrl = string.IsNullOrWhiteSpace(appSettings.EndpointUrl)
+        ? PromptForEndpointUrl()
+        : appSettings.EndpointUrl.Trim();
+    var minDelay = Math.Clamp(appSettings.DelayLowerBoundMs, 500, 1000);
+    var maxDelay = Math.Clamp(appSettings.DelayUpperBoundMs, 500, 1000);
+    if (minDelay > maxDelay)
+    {
+        (minDelay, maxDelay) = (maxDelay, minDelay);
+    }
+    var maxDelayExclusive = maxDelay + 1;
+
+    Console.WriteLine("=== Witaj w narzędziu weryfikacji praw jazdy ===");
+    Console.WriteLine($"Roboczy katalog: {workingDirectory}");
+    Console.WriteLine($"Endpoint SOAP: {endpointUrl}");
+    Console.WriteLine($"Limit opóźnień: {minDelay} ms - {maxDelay} ms");
+    Console.WriteLine();
+
+    var csvPath = PromptForFileSelection(workingDirectory, "*.csv", "Wybierz plik CSV z zapytaniami");
+    if (csvPath is null)
+    {
+        Console.Error.WriteLine("Nie znaleziono żadnych plików CSV. Kończę działanie.");
+        return -4;
+    }
+
+    var certPath = PromptForFileSelection(workingDirectory, "*.p12", "Wybierz certyfikat klienta (.p12)");
+    if (certPath is null)
+    {
+        Console.Error.WriteLine("Nie znaleziono żadnych certyfikatów .p12. Kończę działanie.");
+        return -4;
+    }
+
+    Console.Write("Certyfikat może być zabezpieczony hasłem. Jeśli go nie ma, pozostaw puste.\nPodaj hasło do certyfikatu: ");
+    var certPassword = Console.ReadLine() ?? string.Empty;
+
+    var outputPath = PromptForOutputPath(workingDirectory);
+    outputPath = EnsureUniqueOutputPath(outputPath);
 
     var jsonOptions = new JsonSerializerOptions
     {
@@ -30,203 +71,221 @@ static async Task<int> RunAsync()
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    var minDelay = Math.Clamp(app.DelayLowerBound_ms, 5000, 10000);
-    var maxDelay = Math.Clamp(app.DelayUpperBound_ms, 5000, 10000);
-    if (minDelay > maxDelay)
+    var requests = LoadRequestsFromCsv(csvPath);
+    if (requests.Count == 0)
     {
-        (minDelay, maxDelay) = (maxDelay, minDelay);
+        Console.WriteLine("Plik CSV nie zawiera poprawnych wierszy do przetworzenia. Utworzono pusty plik wynikowy.");
+        EnsureOutputDirectory(outputPath);
+        using var emptyWriter = new StreamWriter(outputPath, false, new UTF8Encoding(false));
+        using var emptyCsv = new CsvWriter(emptyWriter, CultureInfo.InvariantCulture);
+        emptyCsv.WriteHeader<DriverCategoryInfo>();
+        emptyCsv.NextRecord();
+        return 0;
     }
-    var maxDelayExclusive = maxDelay + 1;
 
-    var binding = new BasicHttpsBinding()
+    Console.WriteLine($"\nPrzygotowano {requests.Count} zapytań. Status: weryfikacja w toku...\n");
+
+    var random = new Random();
+
+    EnsureOutputDirectory(outputPath);
+    await using var verifier = new DriverLicenseVerifier(endpointUrl, certPath, certPassword);
+    await using var outputStream = new StreamWriter(outputPath, false, new UTF8Encoding(false));
+    await using var outputCsv = new CsvWriter(outputStream, CultureInfo.InvariantCulture);
+    outputCsv.WriteHeader<DriverCategoryInfo>();
+    outputCsv.NextRecord();
+    await outputStream.FlushAsync();
+
+    var exitCode = 0;
+    var totalWritten = 0;
+
+    for (var index = 0; index < requests.Count; index++)
     {
-        Security = new BasicHttpsSecurity()
+        var request = requests[index];
+        Console.WriteLine($"[{index + 1}/{requests.Count}] Weryfikuję {request.imiePierwsze} {request.nazwisko} ({request.seriaNumerBlankietuDruku})...");
+
+        try
         {
-            Mode = BasicHttpsSecurityMode.Transport,
-            Transport = { ClientCredentialType = HttpClientCredentialType.Certificate }
+            var records = await verifier.VerifyAsync(request, CancellationToken.None).ConfigureAwait(false);
+
+            if (records.Count == 0)
+            {
+                Console.WriteLine("  Brak danych kategorii w odpowiedzi.");
+            }
+            else
+            {
+                foreach (var record in records)
+                {
+                    Console.WriteLine(JsonSerializer.Serialize(record, jsonOptions));
+                    outputCsv.WriteRecord(record);
+                    outputCsv.NextRecord();
+                    totalWritten++;
+                }
+
+                await outputStream.FlushAsync();
+            }
+
+            Console.WriteLine("  Zakończono.");
         }
-    };
-
-    var address = new EndpointAddress(app.EndpointUrl);
-    UprawnieniaKierowcowPrzewoznicyApiClient? client = null;
-
-    try
-    {
-        client = new UprawnieniaKierowcowPrzewoznicyApiClient(binding, address);
-
-        client.ClientCredentials.ServiceCertificate.SslCertificateAuthentication =
-            new X509ServiceCertificateAuthentication
-            {
-                CertificateValidationMode = X509CertificateValidationMode.None
-            };
-
-        var cert = string.IsNullOrWhiteSpace(app.ClientCertPassword)
-            ? new X509Certificate2(app.ClientCertPath)
-            : new X509Certificate2(app.ClientCertPath, app.ClientCertPassword);
-
-        client.ClientCredentials.ClientCertificate.Certificate = cert;
-
-        var inputPath = ResolveInputCsvPath(app);
-        var requests = LoadRequestsFromCsv(inputPath);
-        var random = new Random();
-        var csvOutputPath = Path.Combine(Environment.CurrentDirectory, "output.csv");
-        var exitCode = 0;
-
-        if (requests.Count == 0)
+        catch (FaultException<CepikException> cepikFault)
         {
-            Console.WriteLine($"Brak rekordów w pliku wejściowym {inputPath}. Zapisano pusty plik {csvOutputPath}.");
-            try
+            var faultExitCode = SoapFaultReporter.HandleFault(request, cepikFault, jsonOptions);
+            if (exitCode == 0)
             {
-                using var csvStream = new StreamWriter(csvOutputPath, false, new UTF8Encoding(false));
-                using var csv = new CsvWriter(csvStream, CultureInfo.InvariantCulture);
-                csv.WriteHeader<DriverCategoryInfo>();
-                csv.NextRecord();
-            }
-            catch (Exception csvEx)
-            {
-                Console.Error.WriteLine($"Błąd zapisu do pliku CSV '{csvOutputPath}': {csvEx.Message}");
-                return -2;
-            }
-
-            return exitCode;
-        }
-
-        using var outputStream = new StreamWriter(csvOutputPath, false, new UTF8Encoding(false));
-        using var outputCsv = new CsvWriter(outputStream, CultureInfo.InvariantCulture);
-        outputCsv.WriteHeader<DriverCategoryInfo>();
-        outputCsv.NextRecord();
-        outputStream.Flush();
-
-        Console.WriteLine($"Rozpoczynam przetwarzanie {requests.Count} zapytań z pliku {inputPath}.");
-
-        var totalWritten = 0;
-
-        for (var i = 0; i < requests.Count; i++)
-        {
-            var request = requests[i];
-
-            try
-            {
-                var response = await client.pytanieOUprawnieniaAsync(request).ConfigureAwait(false);
-                var flattened = ParseResponse(request, response?.DaneDokumentuResponse);
-
-                if (flattened.Count == 0)
-                {
-                    Console.WriteLine($"Brak danych kategorii w odpowiedzi dla {request.imiePierwsze} {request.nazwisko} ({request.seriaNumerBlankietuDruku}).");
-                }
-                else
-                {
-                    foreach (var record in flattened)
-                    {
-                        Console.WriteLine(JsonSerializer.Serialize(record, jsonOptions));
-                        try
-                        {
-                            outputCsv.WriteRecord(record);
-                            outputCsv.NextRecord();
-                            outputStream.Flush();
-                            totalWritten++;
-                        }
-                        catch (Exception csvEx)
-                        {
-                            LogFailure(request, $"CSV write failed: {csvEx.GetType().Name}", csvEx.ToString(), jsonOptions);
-                            Console.Error.WriteLine($"Błąd zapisu do pliku CSV '{csvOutputPath}': {csvEx.Message}");
-                            return -2;
-                        }
-                    }
-                }
-            }
-            catch (FaultException<CepikException> cepikFault)
-            {
-                LogFailure(request, $"SOAP Fault: {cepikFault.Code.Name}", BuildFaultDetails(cepikFault), jsonOptions);
-
-                Console.Error.WriteLine($"Fault Code: {cepikFault.Code.Name}");
-                Console.Error.WriteLine($"Fault Reason: {cepikFault.Reason.GetMatchingTranslation().Text}");
-
-                if (cepikFault.Detail?.komunikaty != null)
-                {
-                    Console.Error.WriteLine("\nSzczegóły błędu:");
-                    foreach (var kom in cepikFault.Detail.komunikaty)
-                    {
-                        Console.Error.WriteLine($"  Typ: {kom.typ}");
-                        Console.Error.WriteLine($"  Kod: {kom.kod}");
-                        Console.Error.WriteLine($"  Komunikat: {kom.komunikat}");
-
-                        if (!string.IsNullOrEmpty(kom.szczegoly))
-                            Console.Error.WriteLine($"  Szczegóły: {kom.szczegoly}");
-
-                        if (!string.IsNullOrEmpty(kom.identyfikatorBledu))
-                            Console.Error.WriteLine($"  ID błędu: {kom.identyfikatorBledu}");
-
-                        Console.Error.WriteLine();
-                    }
-                }
-
-                if (exitCode == 0)
-                {
-                    exitCode = -1;
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFailure(request, ex.GetType().Name, ex.ToString(), jsonOptions);
-
-                Console.Error.WriteLine("Call failed:");
-                Console.Error.WriteLine(ex);
-
-                exitCode = -3;
-            }
-
-            if (i < requests.Count - 1)
-            {
-                var delayMs = random.Next(minDelay, maxDelayExclusive);
-                await Task.Delay(delayMs).ConfigureAwait(false);
+                exitCode = faultExitCode;
             }
         }
+        catch (Exception ex)
+        {
+            FailureLogger.LogRequestFailure(request, ex.GetType().Name, ex.ToString(), jsonOptions);
 
-        Console.WriteLine($"Zapisano {totalWritten} rekordów do {csvOutputPath}.");
+            Console.Error.WriteLine("  Call failed:");
+            Console.Error.WriteLine(ex);
 
-        return exitCode;
+            exitCode = -3;
+        }
+
+        if (index < requests.Count - 1)
+        {
+            var delayMs = random.Next(minDelay, maxDelayExclusive);
+            await Task.Delay(delayMs).ConfigureAwait(false);
+        }
     }
-    finally
+
+    Console.WriteLine($"\nStatus: weryfikacja zakończona. Zapisano {totalWritten} rekordów do {outputPath}.");
+
+    return exitCode;
+}
+
+static string ResolveWorkingDirectory(string? configuredPath)
+{
+    if (string.IsNullOrWhiteSpace(configuredPath))
     {
-        if (client != null)
+        return Environment.CurrentDirectory;
+    }
+
+    if (!Path.IsPathRooted(configuredPath))
+    {
+        configuredPath = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, configuredPath));
+    }
+
+    return Directory.Exists(configuredPath)
+        ? configuredPath
+        : throw new DirectoryNotFoundException($"Nie znaleziono katalogu roboczego: {configuredPath}");
+}
+
+static string? PromptForFileSelection(string workingDirectory, string searchPattern, string prompt)
+{
+    var files = Directory.EnumerateFiles(workingDirectory, searchPattern, SearchOption.AllDirectories)
+        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    if (files.Count == 0)
+    {
+        return null;
+    }
+
+    Console.WriteLine(prompt + ":");
+    for (var i = 0; i < files.Count; i++)
+    {
+        var relative = Path.GetRelativePath(workingDirectory, files[i]);
+        Console.WriteLine($"  {i + 1}. {relative}");
+    }
+
+    while (true)
+    {
+        Console.Write($"Wybierz numer [1-{files.Count}]: ");
+        var input = Console.ReadLine();
+        if (int.TryParse(input, out var index) && index >= 1 && index <= files.Count)
         {
-            try { if (client.State != CommunicationState.Closed) client.Close(); }
-            catch { client.Abort(); }
+            Console.WriteLine();
+            return files[index - 1];
         }
+
+        Console.WriteLine("Niepoprawny wybór. Spróbuj ponownie.");
     }
 }
 
-static string ResolveInputCsvPath(AppSettings settings)
+static string PromptForEndpointUrl()
 {
-    var path = settings.InputCsvPath;
+    Console.Write("Podaj adres endpointu SOAP: ");
+    return ReadRequiredLine();
+}
 
-    if (string.IsNullOrWhiteSpace(path))
+static string PromptForOutputPath(string workingDirectory)
+{
+    while (true)
     {
-        path = Path.Combine(Environment.CurrentDirectory, "dokumentacja", "input.csv");
+        Console.Write("Podaj nazwę pliku wynikowego (np. output.csv): ");
+        var input = Console.ReadLine();
+
+        var candidate = string.IsNullOrWhiteSpace(input) ? "output.csv" : input.Trim();
+        candidate = candidate.EndsWith(".csv", StringComparison.OrdinalIgnoreCase) ? candidate : candidate + ".csv";
+
+        if (candidate.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            Console.WriteLine("Podana nazwa zawiera nieprawidłowe znaki. Spróbuj ponownie.");
+            continue;
+        }
+
+        var path = Path.IsPathRooted(candidate)
+            ? candidate
+            : Path.Combine(workingDirectory, candidate);
+
+        Console.WriteLine();
+        return path;
     }
-    else if (!Path.IsPathRooted(path))
+}
+
+static string ReadRequiredLine()
+{
+    while (true)
     {
-        path = Path.GetFullPath(path);
+        var line = Console.ReadLine();
+        if (!string.IsNullOrWhiteSpace(line))
+        {
+            return line.Trim();
+        }
+
+        Console.Write("Wartość wymagana. Podaj ponownie: ");
+    }
+}
+
+static void EnsureOutputDirectory(string outputPath)
+{
+    var directory = Path.GetDirectoryName(outputPath);
+    if (!string.IsNullOrWhiteSpace(directory))
+    {
+        Directory.CreateDirectory(directory);
+    }
+}
+
+static string EnsureUniqueOutputPath(string initialPath)
+{
+    if (!File.Exists(initialPath))
+    {
+        return initialPath;
     }
 
-    return path;
+    var directory = Path.GetDirectoryName(initialPath) ?? string.Empty;
+    var fileName = Path.GetFileNameWithoutExtension(initialPath);
+    var extension = Path.GetExtension(initialPath);
+    var counter = 1;
+
+    while (true)
+    {
+        var candidate = Path.Combine(directory, $"{fileName}_{counter}{extension}");
+        if (!File.Exists(candidate))
+        {
+            return candidate;
+        }
+
+        counter++;
+    }
 }
 
 static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath)
 {
     var requests = new List<DaneDokumentuRequest>();
-
-    if (string.IsNullOrWhiteSpace(inputPath))
-    {
-        return requests;
-    }
-
-    if (!File.Exists(inputPath))
-    {
-        Console.Error.WriteLine($"Nie znaleziono pliku wejściowego: {inputPath}");
-        return requests;
-    }
 
     var csvConfig = new CsvConfiguration(CultureInfo.InvariantCulture)
     {
@@ -292,132 +351,6 @@ static Encoding GetInputCsvEncoding()
     }
 }
 
-static List<DriverCategoryInfo> ParseResponse(DaneDokumentuRequest request, DaneDokumentuResponse? response)
-{
-    var result = new List<DriverCategoryInfo>();
-
-    if (response?.dokumentPotwierdzajacyUprawnienia?.daneUprawnieniaKategorii == null)
-    {
-        return result;
-    }
-
-    var document = response.dokumentPotwierdzajacyUprawnienia;
-    var status = document.stanDokumentu?.stanDokumentu;
-    var revocationReasons = document.stanDokumentu?.powodZmianyStanu ?? Array.Empty<KodWartoscSlownikowa>();
-    var reasonText = BuildKeyValueMessagesFromList(revocationReasons);
-    var statusText = BuildKeyValueMessage(status);
-    var licenseNumber = string.IsNullOrWhiteSpace(document.seriaNumerBlankietuDruku)
-        ? request.seriaNumerBlankietuDruku
-        : document.seriaNumerBlankietuDruku;
-
-    foreach (var category in document.daneUprawnieniaKategorii)
-    {
-        if (category == null)
-        {
-            continue;
-        }
-
-        result.Add(new DriverCategoryInfo(
-            request.imiePierwsze ?? string.Empty,
-            request.nazwisko ?? string.Empty,
-            licenseNumber ?? string.Empty,
-            statusText ?? string.Empty,
-            category.kategoria ?? string.Empty,
-            category.dataWaznosciSpecified ? category.dataWaznosci : new DateTime(2099, 12, 31),
-            reasonText));
-    }
-
-    return result;
-}
-
-
-static string? BuildKeyValueMessagesFromList(IEnumerable<KodWartoscSlownikowa> keyValue)
-{
-    var keyValueFragments = keyValue
-        .Where(keyValue => keyValue != null && (!string.IsNullOrWhiteSpace(keyValue.kod) || !string.IsNullOrWhiteSpace(keyValue.wartosc)))
-        .Select(keyValue => BuildKeyValueMessage(keyValue))
-        .Where(fragment => !string.IsNullOrWhiteSpace(fragment))
-        .ToArray();
-
-    return keyValueFragments.Length == 0 ? null : string.Join("; ", keyValueFragments);
-}
-
-static string? BuildKeyValueMessage(KodWartoscSlownikowa? keyValue)
-{
-    if (keyValue is null)
-    {
-        return string.Empty;
-    }
-
-    var parts = new List<string>();
-    if (!string.IsNullOrWhiteSpace(keyValue.kod))
-    {
-        parts.Add(keyValue.kod.Trim());
-    }
-    if (!string.IsNullOrWhiteSpace(keyValue.wartosc))
-    {
-        parts.Add(keyValue.wartosc.Trim());
-    }
-    return string.Join(" - ", parts);
-}
-
-static string? BuildFaultDetails(FaultException<CepikException> fault)
-{
-    if (fault.Detail?.komunikaty == null || fault.Detail.komunikaty.Length == 0)
-    {
-        return null;
-    }
-
-    var builder = new StringBuilder();
-    foreach (var message in fault.Detail.komunikaty)
-    {
-        if (message == null)
-        {
-            continue;
-        }
-
-        builder.Append('[')
-               .Append(message.typ.ToString())
-               .Append("] ");
-
-        if (!string.IsNullOrWhiteSpace(message.kod))
-        {
-            builder.Append(message.kod.Trim()).Append(' ');
-        }
-
-        if (!string.IsNullOrWhiteSpace(message.komunikat))
-        {
-            builder.Append(message.komunikat.Trim());
-        }
-
-        if (!string.IsNullOrWhiteSpace(message.szczegoly))
-        {
-            builder.Append(" (").Append(message.szczegoly.Trim()).Append(')');
-        }
-
-        if (!string.IsNullOrWhiteSpace(message.identyfikatorBledu))
-        {
-            builder.Append(" id:").Append(message.identyfikatorBledu.Trim());
-        }
-
-        builder.AppendLine();
-    }
-
-    return builder.ToString().TrimEnd();
-}
-
-static void LogFailure(DaneDokumentuRequest request, string errorLabel, string? errorDetails, JsonSerializerOptions options)
-{
-    var payload = new DriverErrorLog(
-        request.imiePierwsze ?? string.Empty,
-        request.nazwisko ?? string.Empty,
-        request.seriaNumerBlankietuDruku ?? string.Empty,
-        errorLabel,
-        errorDetails);
-
-    Console.Error.WriteLine(JsonSerializer.Serialize(payload, options));
-}
-
 sealed class DriverInputRow
 {
     public string? FirstName { get; set; }
@@ -434,19 +367,3 @@ sealed class DriverInputRowMap : ClassMap<DriverInputRow>
         Map(m => m.DocumentNumber).Name("NumerDokumentu", "Numer Dokumentu", "NumerBlankietu", "Numer", "NUMERDOKUMENTU");
     }
 }
-
-internal sealed record DriverCategoryInfo(
-    string Imie,
-    string Nazwisko,
-    string NumerBlankietu,
-    string Status,
-    string Kategoria,
-    DateTime? DataWaznosci,
-    string? PowodZmiany);
-
-internal sealed record DriverErrorLog(
-    string Imie,
-    string Nazwisko,
-    string NumerBlankietu,
-    string Blad,
-    string? Szczegoly);

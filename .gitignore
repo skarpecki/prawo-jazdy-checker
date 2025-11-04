@@ -4,6 +4,8 @@ obj
 *.docx
 *.pem
 *.jks
+*.p12
+*.csv
 appsettings.json
 ServiceReference/dotnet-svcutil.params.json
 dokumentacja
