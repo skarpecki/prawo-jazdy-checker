@@ -1,4 +1,8 @@
+using CsvHelper;
 using Microsoft.Extensions.Configuration;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.ServiceModel;
@@ -55,14 +59,31 @@ try
     var response = client.pytanieOUprawnieniaAsync(request).GetAwaiter().GetResult();
 
     var flattened = ParseResponse(request, response?.DaneDokumentuResponse);
+    var csvOutputPath = Path.Combine(Environment.CurrentDirectory, "output.csv");
+
+    try
+    {
+        WriteCsv(csvOutputPath, flattened);
+    }
+    catch (Exception csvEx)
+    {
+        LogFailure(request, $"CSV write failed: {csvEx.GetType().Name}", csvEx.ToString(), jsonOptions);
+        Console.Error.WriteLine($"Błąd zapisu do pliku CSV '{csvOutputPath}': {csvEx.Message}");
+        return -2;
+    }
+
+    foreach (var record in flattened)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(record, jsonOptions));
+    }
 
     if (flattened.Count == 0)
     {
-        Console.WriteLine("Brak danych kategorii w odpowiedzi.");
+        Console.WriteLine("Brak danych kategorii w odpowiedzi. Zapisano pusty plik output.csv.");
     }
     else
     {
-        Console.WriteLine(JsonSerializer.Serialize(flattened, jsonOptions));
+        Console.WriteLine($"Zapisano {flattened.Count} rekordów do {csvOutputPath}.");
     }
 
     return 0;
@@ -236,18 +257,33 @@ static void LogFailure(DaneDokumentuRequest request, string errorLabel, string? 
     Console.Error.WriteLine(JsonSerializer.Serialize(payload, options));
 }
 
+static void WriteCsv(string filePath, IReadOnlyCollection<DriverCategoryInfo> rows)
+{
+    using var writer = new StreamWriter(filePath, false, new UTF8Encoding(false));
+    using var csv = new CsvWriter(writer, CultureInfo.InvariantCulture);
+
+    if (rows.Count == 0)
+    {
+        csv.WriteHeader<DriverCategoryInfo>();
+        csv.NextRecord();
+        return;
+    }
+
+    csv.WriteRecords(rows);
+}
+
 internal sealed record DriverCategoryInfo(
-    string FirstName,
-    string LastName,
-    string LicenseNumber,
-    string LicenseStatus,
-    string Category,
-    DateTime? CategoryExpiryDate,
-    string? RevocationReason);
+    string Imie,
+    string Nazwisko,
+    string NumerBlankietu,
+    string Status,
+    string Kategoria,
+    DateTime? DataWaznosci,
+    string? PowodZmiany);
 
 internal sealed record DriverErrorLog(
-    string FirstName,
-    string LastName,
-    string LicenseNumber,
-    string Error,
-    string? Details);
+    string Imie,
+    string Nazwisko,
+    string NumerBlankietu,
+    string Blad,
+    string? Szczegoly);
