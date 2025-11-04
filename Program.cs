@@ -9,6 +9,7 @@ using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Encodings.Web;
 using System.Threading;
 using System.Threading.Tasks;
 using UpkiClient;
@@ -62,16 +63,22 @@ static async Task<int> RunAsync()
     Console.Write("Certyfikat może być zabezpieczony hasłem. Jeśli go nie ma, pozostaw puste.\nPodaj hasło do certyfikatu: ");
     var certPassword = Console.ReadLine() ?? string.Empty;
 
+    var (inputEncoding, delimiter) = DetectCsvFormat(csvPath);
+    Console.WriteLine($"Wykryto kodowanie pliku: {inputEncoding.EncodingName}");
+    Console.WriteLine($"Wykryto separator: {FormatDelimiterForDisplay(delimiter)}");
+    Console.WriteLine();
+
     var outputPath = PromptForOutputPath(workingDirectory);
     outputPath = EnsureUniqueOutputPath(outputPath);
 
     var jsonOptions = new JsonSerializerOptions
     {
         WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
-    var requests = LoadRequestsFromCsv(csvPath);
+    var requests = LoadRequestsFromCsv(csvPath, inputEncoding, delimiter);
     if (requests.Count == 0)
     {
         Console.WriteLine("Plik CSV nie zawiera poprawnych wierszy do przetworzenia. Utworzono pusty plik wynikowy.");
@@ -176,6 +183,7 @@ static string ResolveWorkingDirectory(string? configuredPath)
 static string? PromptForFileSelection(string workingDirectory, string searchPattern, string prompt)
 {
     var files = Directory.EnumerateFiles(workingDirectory, searchPattern, SearchOption.AllDirectories)
+        .Where(path => !Path.GetFileName(path).Contains("output", StringComparison.OrdinalIgnoreCase))
         .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
         .ToList();
 
@@ -283,13 +291,174 @@ static string EnsureUniqueOutputPath(string initialPath)
     }
 }
 
-static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath)
+static (Encoding Encoding, string Delimiter) DetectCsvFormat(string path)
+{
+    var encoding = DetectCsvEncoding(path);
+    var delimiter = DetectDelimiter(path, encoding);
+    return (encoding, delimiter);
+}
+
+static Encoding DetectCsvEncoding(string path)
+{
+    var candidates = new List<Encoding>
+    {
+        Encoding.UTF8,
+        Encoding.Unicode,
+        Encoding.BigEndianUnicode,
+        Encoding.UTF32
+    };
+
+    TryAddEncoding(candidates, "windows-1250");
+    TryAddEncoding(candidates, "ISO-8859-2");
+    candidates.Add(Encoding.Latin1);
+
+    const int probeLength = 4096;
+    byte[] buffer;
+
+    using (var stream = File.OpenRead(path))
+    {
+        var len = (int)Math.Min(probeLength, stream.Length);
+        buffer = new byte[len];
+        _ = stream.Read(buffer, 0, len);
+    }
+
+    Encoding bestEncoding = Encoding.UTF8;
+    double bestScore = double.NegativeInfinity;
+
+    foreach (var candidate in candidates)
+    {
+        string text;
+        try
+        {
+            text = candidate.GetString(buffer);
+        }
+        catch
+        {
+            continue;
+        }
+
+        var score = ScoreSample(text);
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestEncoding = candidate;
+        }
+    }
+
+    return bestEncoding;
+
+    static void TryAddEncoding(ICollection<Encoding> list, string name)
+    {
+        try
+        {
+            list.Add(Encoding.GetEncoding(name));
+        }
+        catch
+        {
+            // pomijamy, jeśli kodowanie nie jest dostępne
+        }
+    }
+}
+
+static string DetectDelimiter(string path, Encoding encoding)
+{
+    var delimiters = new[] { ",", ";", "\t", "|" };
+    var lines = new List<string>();
+
+    using (var reader = new StreamReader(path, encoding, detectEncodingFromByteOrderMarks: true))
+    {
+        while (!reader.EndOfStream && lines.Count < 20)
+        {
+            var line = reader.ReadLine();
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                lines.Add(line);
+            }
+        }
+    }
+
+    if (lines.Count == 0)
+    {
+        return ",";
+    }
+
+    var bestDelimiter = ",";
+    var bestScore = -1;
+
+    foreach (var delimiter in delimiters)
+    {
+        var counts = lines
+            .Select(line => line.Split(new[] { delimiter }, StringSplitOptions.None).Length)
+            .ToList();
+
+        var firstCount = counts[0];
+        if (firstCount <= 1)
+        {
+            continue;
+        }
+
+        if (counts.All(count => count == firstCount))
+        {
+            var separators = counts.Sum(count => count - 1);
+            if (separators > bestScore)
+            {
+                bestScore = separators;
+                bestDelimiter = delimiter;
+            }
+        }
+    }
+
+    return bestDelimiter;
+}
+
+static double ScoreSample(string sample)
+{
+    if (string.IsNullOrEmpty(sample))
+    {
+        return double.NegativeInfinity;
+    }
+
+    const string polishChars = "ĄąĆćĘęŁłŃńÓóŚśŹźŻż";
+    var polishLetters = 0;
+    var replacementChars = 0;
+    var questionMarks = 0;
+
+    foreach (var ch in sample)
+    {
+        if (polishChars.IndexOf(ch) >= 0)
+        {
+            polishLetters++;
+        }
+        else if (ch == '\uFFFD')
+        {
+            replacementChars++;
+        }
+        else if (ch == '?')
+        {
+            questionMarks++;
+        }
+    }
+
+    return polishLetters * 5 - replacementChars * 20 - questionMarks * 2;
+}
+
+static string FormatDelimiterForDisplay(string delimiter) =>
+    delimiter switch
+    {
+        "\t" => "Tabulator (\\t)",
+        "," => "Przecinek (,)",
+        ";" => "Średnik (;)",
+        "|" => "Pionowa kreska (|)",
+        _ => $"'{delimiter}'"
+    };
+
+static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath, Encoding encoding, string delimiter)
 {
     var requests = new List<DaneDokumentuRequest>();
 
     var csvConfig = new CsvConfiguration(CultureInfo.InvariantCulture)
     {
-        Delimiter = "\t",
+        Delimiter = delimiter,
         TrimOptions = TrimOptions.Trim,
         MissingFieldFound = null,
         HeaderValidated = null,
@@ -297,7 +466,7 @@ static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath)
         PrepareHeaderForMatch = args => args.Header?.Trim()
     };
 
-    using var reader = new StreamReader(inputPath, GetInputCsvEncoding(), detectEncodingFromByteOrderMarks: true);
+    using var reader = new StreamReader(inputPath, encoding, detectEncodingFromByteOrderMarks: true);
     using var csv = new CsvReader(reader, csvConfig);
     csv.Context.RegisterClassMap<DriverInputRowMap>();
 
@@ -311,9 +480,9 @@ static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath)
                 continue;
             }
 
-            var firstName = row.FirstName?.Trim();
-            var lastName = row.LastName?.Trim();
-            var documentNumber = row.DocumentNumber?.Trim();
+            var firstName = CleanField(row.FirstName);
+            var lastName = CleanField(row.LastName);
+            var documentNumber = CleanField(row.DocumentNumber);
 
             if (string.IsNullOrWhiteSpace(firstName) ||
                 string.IsNullOrWhiteSpace(lastName) ||
@@ -339,16 +508,25 @@ static List<DaneDokumentuRequest> LoadRequestsFromCsv(string inputPath)
     return requests;
 }
 
-static Encoding GetInputCsvEncoding()
+static string CleanField(string? value)
 {
-    try
+    if (string.IsNullOrWhiteSpace(value))
     {
-        return Encoding.GetEncoding("ISO-8859-2");
+        return string.Empty;
     }
-    catch (Exception)
+
+    var builder = new StringBuilder(value.Length);
+    foreach (var ch in value)
     {
-        return Encoding.Latin1;
+        if (char.IsControl(ch) && ch != ' ' && ch != '-' && ch != '\'')
+        {
+            continue;
+        }
+
+        builder.Append(ch);
     }
+
+    return builder.ToString().Trim();
 }
 
 sealed class DriverInputRow
